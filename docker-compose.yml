@@ -1,0 +1,207 @@
+version: "3.9"
+
+services:
+
+  db:
+    image: ankane/pgvector:latest
+    container_name: megaai-db
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+
+    ports:
+      - "${POSTGRES_PORT}:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d:ro
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+    networks:
+      - megaai-network
+
+
+  redis:
+    image: redis:7-alpine
+    container_name: megaai-redis
+    restart: unless-stopped
+
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+
+    ports:
+      - "${REDIS_PORT}:6379"
+
+    volumes:
+      - redis_data:/data
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+    networks:
+      - megaai-network
+
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+
+    container_name: megaai-api
+    restart: unless-stopped
+    working_dir: /app
+
+    environment:
+      PYTHONPATH: /app
+
+      LLM_PROVIDER: ${LLM_PROVIDER}
+      LLM_MODEL: ${LLM_MODEL}
+      LLM_API_KEY: ${LLM_API_KEY}
+
+      FALLBACK_PROVIDER: ${FALLBACK_PROVIDER}
+      FALLBACK_MODEL: ${FALLBACK_MODEL}
+      FALLBACK_API_KEY: ${FALLBACK_API_KEY}
+
+      TERTIARY_PROVIDER: ${TERTIARY_PROVIDER}
+      TERTIARY_MODEL: ${TERTIARY_MODEL}
+      TERTIARY_API_KEY: ${TERTIARY_API_KEY}
+
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+      LOG_LEVEL: ${LOG_LEVEL}
+
+    ports:
+      - "8000:8000"
+
+    depends_on:
+      db:
+        condition: service_healthy
+
+      redis:
+        condition: service_healthy
+
+    volumes:
+      - ./backend:/app:ro
+
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+    networks:
+      - megaai-network
+
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+
+    container_name: megaai-worker
+    restart: unless-stopped
+    working_dir: /app
+
+    environment:
+      PYTHONPATH: /app
+
+      LLM_PROVIDER: ${LLM_PROVIDER}
+      LLM_MODEL: ${LLM_MODEL}
+      LLM_API_KEY: ${LLM_API_KEY}
+
+      FALLBACK_PROVIDER: ${FALLBACK_PROVIDER}
+      FALLBACK_MODEL: ${FALLBACK_MODEL}
+      FALLBACK_API_KEY: ${FALLBACK_API_KEY}
+
+      TERTIARY_PROVIDER: ${TERTIARY_PROVIDER}
+      TERTIARY_MODEL: ${TERTIARY_MODEL}
+      TERTIARY_API_KEY: ${TERTIARY_API_KEY}
+
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+      LOG_LEVEL: ${LOG_LEVEL}
+
+    depends_on:
+      db:
+        condition: service_healthy
+
+      redis:
+        condition: service_healthy
+
+    volumes:
+      - ./backend:/app:ro
+
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=2
+
+    networks:
+      - megaai-network
+
+
+  log_ui:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+
+    container_name: megaai-logui
+    restart: unless-stopped
+    working_dir: /app
+
+    environment:
+      PYTHONPATH: /app
+
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+
+      LOG_UI_API_KEY: ${LOG_UI_API_KEY}
+      LOG_LEVEL: ${LOG_LEVEL}
+
+    ports:
+      - "8001:8001"
+
+    depends_on:
+      db:
+        condition: service_healthy
+
+    volumes:
+      - ./backend:/app:ro
+
+    command: uvicorn app.log_ui:log_ui_app --host 0.0.0.0 --port 8001 --reload
+
+    networks:
+      - megaai-network
+
+
+volumes:
+  postgres_data:
+  redis_data:
+
+
+networks:
+  megaai-network:
+    driver: bridge
