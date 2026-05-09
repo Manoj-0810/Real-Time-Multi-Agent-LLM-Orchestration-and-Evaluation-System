@@ -24,21 +24,21 @@ All architectural decisions, agent logic, failure mode analysis, and evaluation 
 
 ### 3. What I Built vs. What I Used
 
-| Component | Built by Me | AI-Assisted | Third-Party |
+                                      | Component | Built by Me | AI-Assisted | Third-Party |
 |-----------|-------------|-------------|-------------|
-| Architecture & Agent Design | ✅ | ❌ | ❌ |
-| Context Window Manager | ✅ | ❌ | ❌ |
-| LLM Gateway with Fallback | ✅ | ❌ | ❌ |
-| All 7 Agent Implementations | ✅ | ❌ | ❌ |
-| Tool Registry & Failure Contracts | ✅ | ❌ | ❌ |
-| Evaluation Pipeline & Scoring | ✅ | ❌ | ❌ |
-| Database Schema & Models | ✅ | ✅ | ❌ |
-| Docker Compose Configuration | ✅ | ✅ | ❌ |
-| Structured Logging Schema | ✅ | ❌ | ❌ |
-| README & Documentation | ✅ | ✅ | ❌ |
-| LangChain Framework | ❌ | ❌ | ✅ |
-| FastAPI Framework | ❌ | ❌ | ✅ |
-| PostgreSQL & pgvector | ❌ | ❌ | ✅ |
+| Architecture & Agent Design              | ✅ | ❌ | ❌ |
+| Context Window Manager                   | ✅ | ❌ | ❌ |
+| LLM Gateway with Fallback                | ✅ | ❌ | ❌ |
+| All 7 Agent Implementations              | ✅ | ❌ | ❌ |
+| Tool Registry & Failure Contracts        | ✅ | ❌ | ❌ |
+| Evaluation Pipeline & Scoring            | ✅ | ❌ | ❌ |
+| Database Schema & Models                 | ✅ | ✅ | ❌ |
+| Docker Compose Configuration             | ✅ | ✅ | ❌ |
+| Structured Logging Schema                | ✅ | ❌ | ❌ |
+| README & Documentation                   | ✅ | ✅ | ❌ |
+| LangChain Framework                      | ❌ | ❌ | ✅ |
+| FastAPI Framework                        | ❌ | ❌ | ✅ |
+| PostgreSQL & pgvector                    | ❌ | ❌ | ✅ |
 
 ### 4. Why This Matters
 
@@ -56,6 +56,5 @@ The complete source code, git history, and evaluation results are available in t
 
 ---
 
-**Submitted by:** [Candidate Name]
+**Submitted by:** Manoj R S
 **Date:** 2025-01-15
-**Repository:** https://github.com/[username]/mega-ai
