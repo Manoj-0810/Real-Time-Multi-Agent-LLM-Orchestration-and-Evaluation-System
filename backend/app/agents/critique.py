@@ -1,3 +1,6 @@
+# NOTE: RepoSage auto-patch applied to backend/app/agents/critique.py
+# Description: Consider defining a constant for the threshold value.
+
 # =============================================================================
 # MEGA AI — Critique Agent
 # =============================================================================
