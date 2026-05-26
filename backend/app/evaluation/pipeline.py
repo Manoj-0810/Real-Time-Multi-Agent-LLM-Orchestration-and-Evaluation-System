@@ -59,11 +59,13 @@ class EvaluationPipeline:
     async def run_evaluation(
         self,
         category: Optional[str] = None,
+        case_ids_filter: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Run evaluation on test cases.
         
         Args:
             category: Optional category filter ("baseline", "ambiguous", "adversarial").
+            case_ids_filter: Optional list of test case IDs to run exclusively.
             
         Returns:
             Dict with run results and summary.
@@ -71,10 +73,12 @@ class EvaluationPipeline:
         run_id = str(uuid.uuid4())
         start_time = time.time()
         
-        logger.info(f"Starting evaluation run {run_id}", extra={"category": category})
+        logger.info(f"Starting evaluation run {run_id}", extra={"category": category, "case_ids_filter": case_ids_filter})
         
         # Get test cases
         test_cases = get_test_cases(category)
+        if case_ids_filter:
+            test_cases = [tc for tc in test_cases if tc.id in case_ids_filter]
         
         results = []
         for test_case in test_cases:
@@ -123,6 +127,76 @@ class EvaluationPipeline:
             )
         
         self.run_history.append(run_result)
+        
+        # 1. Save EvalRun reproducibility snapshot to database
+        from app.db.connection import save_eval_run
+        try:
+            await save_eval_run(
+                run_id=run_id,
+                test_cases=results,
+                summary=summary,
+                diff_from_previous=run_result.get("diff_from_previous"),
+            )
+            logger.info(f"Successfully saved evaluation run snapshot to DB for run {run_id}")
+        except Exception as e:
+            logger.error(f"Failed to save evaluation run to database: {e}", exc_info=True)
+            
+        # 2. Trigger MetaAgent self-improvement feedback loop for failed dimensions
+        thresholds = {
+            "answer_correctness": 0.6,
+            "citation_accuracy": 0.5,
+            "contradiction_resolution": 0.6,
+            "tool_selection_efficiency": 0.7,
+            "context_budget_compliance": 0.7,
+            "critique_agreement_rate": 0.6,
+        }
+        
+        failed_dimensions = []
+        dimension_scores = summary.get("dimension_scores", {})
+        for dim, score in dimension_scores.items():
+            thresh = thresholds.get(dim, 0.6)
+            if score < thresh:
+                failed_dimensions.append(dim)
+                
+        if failed_dimensions:
+            logger.info(f"Dimensions {failed_dimensions} failed to meet target thresholds. Auto-triggering MetaAgent prompt rewrites...")
+            try:
+                from app.agents.meta import MetaAgent
+                from app.db.connection import save_prompt_rewrite
+                from app.schemas import ContextObject
+                from app.llm_gateway import LLMGateway
+                from app.tools.registry import ToolRegistry
+                
+                # Setup meta context
+                meta_ctx = ContextObject(
+                    job_id=str(uuid.uuid4()),
+                    query="Automatic self-improving prompt rewrite pass",
+                    metadata={"eval_results": summary}
+                )
+                
+                llm = LLMGateway()
+                tools = ToolRegistry()
+                meta_agent = MetaAgent(llm_gateway=llm, tool_registry=tools)
+                
+                # Run optimization rewrite task
+                await meta_agent.execute(meta_ctx)
+                
+                # Extract proposals and store in Database
+                proposals = meta_ctx.metadata.get("proposals", [])
+                for prop in proposals:
+                    rewrite_id = await save_prompt_rewrite(
+                        eval_run_id=run_id,
+                        agent_id=prop["agent_id"],
+                        dimension=prop["dimension"],
+                        original_prompt=prop["original_prompt"],
+                        proposed_prompt=prop["proposed_prompt"],
+                        diff=prop["diff"],
+                        justification=prop["justification"],
+                        status="pending"
+                    )
+                    logger.info(f"Enqueued pending prompt rewrite {rewrite_id} for agent {prop['agent_id']} under review")
+            except Exception as e:
+                logger.error(f"Failed to run MetaAgent self-improvement pipeline: {e}", exc_info=True)
         
         logger.info(
             f"Evaluation run {run_id} complete: "

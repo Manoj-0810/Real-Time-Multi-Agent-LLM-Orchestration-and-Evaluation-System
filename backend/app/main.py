@@ -49,6 +49,8 @@ from app.db.connection import (
     close_db,
     health_check as db_health_check,
     init_db,
+    create_job,
+    update_job_status,
 )
 
 from app.evaluation.pipeline import EvaluationPipeline
@@ -209,9 +211,10 @@ async def submit_query(
     """Submit a query and receive streaming SSE response.
     
     Events:
+    - job_start: {job_id, timestamp}
     - agent_start: {agent_id, timestamp}
     - agent_token: {agent_id, token}
-    - tool_call: {agent_id, tool_name, status}
+    - tool_call: {agent_id, tool_name, status, retry_number}
     - budget_update: {agent_id, remaining_tokens}
     - job_complete: {job_id, summary}
     
@@ -251,8 +254,13 @@ async def submit_query(
         """Generate SSE events."""
         start_time = datetime.utcnow()
         
+        # 1. Create job record in DB
+        await create_job(job_id, query)
+        
         # Send job start
         yield f"event: job_start\ndata: {json.dumps({'job_id': job_id, 'timestamp': start_time.isoformat()})}\n\n"
+        
+        streamed_tools = set()
         
         try:
             # Execute orchestrator
@@ -263,7 +271,14 @@ async def submit_query(
                 output = await orchestrator.execute(ctx)
                 ctx.agent_outputs["orchestrator"] = output
                 
-                # Stream output tokens (simplified)
+                # Stream orchestrator tokens (simulated real-time token streaming)
+                if output.content:
+                    words = output.content.split(' ')
+                    for i, word in enumerate(words):
+                        token = word + ' ' if i < len(words) - 1 else word
+                        yield f"event: agent_token\ndata: {json.dumps({'agent_id': 'orchestrator', 'token': token})}\n\n"
+                        await asyncio.sleep(0.005)
+                
                 yield f"event: agent_end\ndata: {json.dumps({'agent_id': 'orchestrator', 'status': 'completed'})}\n\n"
             
             # Execute agent chain
@@ -293,10 +308,19 @@ async def submit_query(
                     output = await agent.execute(ctx)
                     ctx.agent_outputs[agent_id] = output
                     
-                    # Log tool calls
-                    if hasattr(agent, '_tool_calls'):
-                        for tc in agent._tool_calls:
-                            yield f"event: tool_call\ndata: {json.dumps({'agent_id': agent_id, 'tool_name': tc.get('tool_name'), 'status': 'completed'})}\n\n"
+                    # Stream tokens (simulated real-time token streaming)
+                    if output.content:
+                        words = output.content.split(' ')
+                        for i, word in enumerate(words):
+                            token = word + ' ' if i < len(words) - 1 else word
+                            yield f"event: agent_token\ndata: {json.dumps({'agent_id': agent_id, 'token': token})}\n\n"
+                            await asyncio.sleep(0.005)
+                    
+                    # Yield tool calls that occurred during this agent execution
+                    for key, tr in list(ctx.tool_results.items()):
+                        if tr.tool_name not in streamed_tools:
+                            yield f"event: tool_call\ndata: {json.dumps({'agent_id': agent_id, 'tool_name': tr.tool_name, 'status': 'completed' if tr.accepted else 'failed', 'retry_number': tr.retry_number})}\n\n"
+                            streamed_tools.add(tr.tool_name)
                     
                     yield f"event: agent_end\ndata: {json.dumps({'agent_id': agent_id, 'status': 'completed'})}\n\n"
                     
@@ -327,10 +351,15 @@ async def submit_query(
                 "tokens_used": budget.get_total_usage().get("total_consumed", 0),
             }
             
+            # Update job status in database to completed
+            await update_job_status(job_id, "completed")
+            
             yield f"event: job_complete\ndata: {json.dumps(summary)}\n\n"
             
         except Exception as e:
             logger.error(f"Job failed: {e}", extra={"job_id": job_id})
+            # Update job status in database to failed
+            await update_job_status(job_id, "failed")
             yield f"event: error\ndata: {json.dumps({'job_id': job_id, 'error': str(e)})}\n\n"
     
     return StreamingResponse(
@@ -556,72 +585,115 @@ async def review_rewrite(
 
 
 # =============================================================================
-# Endpoint 5: POST /api/v1/eval/rerun-failed
+# Celery Task Wrapper & Endpoint 5: POST /api/v1/eval/rerun-failed
 # =============================================================================
 
-@app.post("/api/v1/eval/rerun-failed")
-async def rerun_failed_eval(
-    background_tasks: BackgroundTasks,
-    eval_run_id: Optional[str] = None,
-):
-    """Trigger re-evaluation on failed cases.
+async def _get_failed_case_ids(eval_run_id: Optional[str]) -> Optional[List[str]]:
+    """Helper to query database for failed case IDs from an evaluation run."""
+    from sqlalchemy import select
+    from app.db.connection import get_session
+    from app.db.models import EvalRun
+    import uuid
     
-    Re-runs evaluation using latest approved prompts.
-    Returns a delta report comparing runs.
-    
-    Args:
-        background_tasks: FastAPI background tasks.
-        eval_run_id: Optional specific eval run to re-run.
-        
-    Returns:
-        Job status for async re-evaluation.
-    """
-    job_id = str(uuid.uuid4())
-    
-    # Start background evaluation
-    background_tasks.add_task(
-        _run_evaluation_background,
-        job_id=job_id,
-        eval_run_id=eval_run_id,
-    )
-    
-    logger.info(f"Re-evaluation started: {job_id}", extra={"eval_run_id": eval_run_id})
-    
-    return {
-        "job_id": job_id,
-        "status": "running",
-        "message": "Re-evaluation started in background",
-        "check_status": f"/api/v1/eval/latest",
-    }
-
-
-async def _run_evaluation_background(
-    job_id: str,
-    eval_run_id: Optional[str] = None,
-) -> None:
-    """Run evaluation in background.
-    
-    Args:
-        job_id: Background job ID.
-        eval_run_id: Optional eval run to base on.
-    """
     try:
+        async with get_session() as session:
+            if eval_run_id:
+                query = select(EvalRun).where(EvalRun.id == uuid.UUID(eval_run_id))
+            else:
+                # Latest eval run
+                query = select(EvalRun).order_by(EvalRun.run_timestamp.desc()).limit(1)
+                
+            result = await session.execute(query)
+            eval_run = result.scalar_one_or_none()
+            
+            if not eval_run or not eval_run.test_cases:
+                return None
+                
+            # Filter test cases where score in any dimension is below threshold
+            thresholds = {
+                "answer_correctness": 0.6,
+                "citation_accuracy": 0.5,
+                "contradiction_resolution": 0.6,
+                "tool_selection_efficiency": 0.7,
+                "context_budget_compliance": 0.7,
+                "critique_agreement_rate": 0.6,
+            }
+            
+            failed_ids = []
+            for case in eval_run.test_cases:
+                case_id = case.get("test_case_id")
+                scores = case.get("scores", {})
+                is_failed = False
+                for dim, score_data in scores.items():
+                    score = 0.0
+                    if isinstance(score_data, dict):
+                        score = score_data.get("score", 0.0)
+                    elif isinstance(score_data, (int, float)):
+                        score = float(score_data)
+                    if score < thresholds.get(dim, 0.6):
+                        is_failed = True
+                        break
+                if is_failed and case_id:
+                    failed_ids.append(case_id)
+            
+            return failed_ids if failed_ids else None
+    except Exception as e:
+        logger.error(f"Failed to retrieve failed case IDs: {e}")
+        return None
+
+
+@celery_app.task(name="app.main.run_evaluation")
+def run_evaluation_task(eval_run_id: Optional[str] = None) -> Dict[str, Any]:
+    """Celery task to run evaluation on failed cases using latest approved prompts."""
+    import asyncio
+    
+    async def run_pipeline():
         llm = LLMGateway()
         tools = ToolRegistry()
         
+        # Instantiate pipeline
         pipeline = EvaluationPipeline(
             agent_factory=lambda: create_agents(llm, tools),
         )
         
-        result = await pipeline.run_evaluation()
+        case_ids_filter = await _get_failed_case_ids(eval_run_id)
+        logger.info(f"Running Celery evaluation background task with case filter: {case_ids_filter}")
+        result = await pipeline.run_evaluation(case_ids_filter=case_ids_filter)
+        return result
+
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         
-        logger.info(
-            f"Background evaluation complete: {job_id}",
-            extra={"overall_score": result.get("summary", {}).get("overall_average")},
-        )
+    return loop.run_until_complete(run_pipeline())
+
+
+@app.post("/api/v1/eval/rerun-failed")
+async def rerun_failed_eval(
+    eval_run_id: Optional[str] = None,
+):
+    """Trigger re-evaluation on failed cases via Celery.
+    
+    Re-runs evaluation using latest approved prompts.
+    
+    Args:
+        eval_run_id: Optional specific eval run ID to re-run.
         
-    except Exception as e:
-        logger.error(f"Background evaluation failed: {e}", exc_info=True)
+    Returns:
+        Job status for Celery background re-evaluation.
+    """
+    task = run_evaluation_task.delay(eval_run_id)
+    
+    logger.info(f"Re-evaluation started via Celery: {task.id}", extra={"eval_run_id": eval_run_id})
+    
+    return {
+        "job_id": task.id,
+        "status": "running",
+        "message": "Re-evaluation started in Celery background task",
+        "check_status": f"/api/v1/eval/latest",
+    }
 
 
 # =============================================================================

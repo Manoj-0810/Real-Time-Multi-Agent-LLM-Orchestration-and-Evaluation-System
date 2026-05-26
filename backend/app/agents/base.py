@@ -269,7 +269,7 @@ class BaseAgent(ABC):
         policy_violations: Optional[List[str]] = None,
     ) -> None:
         """
-        Create structured log entry.
+        Create structured log entry and save to DB in the background.
         """
 
         entry = StructuredLogEntry(
@@ -294,6 +294,60 @@ class BaseAgent(ABC):
         )
 
         self._log_entries.append(entry)
+
+        # Asynchronously write to database in background
+        import asyncio
+        from app.db.connection import save_agent_log
+        try:
+            asyncio.create_task(
+                save_agent_log(
+                    job_id=job_id,
+                    agent_id=self.agent_id,
+                    event_type=event_type,
+                    input_hash=entry.input_hash,
+                    output_hash=entry.output_hash,
+                    input_payload=input_payload,
+                    output_payload=output_payload,
+                    latency_ms=latency_ms,
+                    token_count=token_count,
+                    policy_violations=entry.policy_violations,
+                )
+            )
+        except Exception as e:
+            logger.error(f"Failed to trigger background log save: {e}")
+
+    # =========================================================================
+    # Dynamic Prompts
+    # =========================================================================
+
+    async def get_effective_prompt(self) -> str:
+        """
+        Get custom approved prompt from database, or fallback to default prompt.
+        """
+        from app.db.connection import get_session
+        from app.db.models import PromptRewrite
+        from sqlalchemy import select
+        
+        try:
+            async with get_session() as session:
+                query = (
+                    select(PromptRewrite)
+                    .where(PromptRewrite.agent_id == self.agent_id)
+                    .where(PromptRewrite.status == "approved")
+                    .order_by(PromptRewrite.reviewed_at.desc())
+                    .limit(1)
+                )
+                result = await session.execute(query)
+                rewrite = result.scalar_one_or_none()
+                if rewrite:
+                    logger.info(f"Loaded approved custom prompt for agent {self.agent_id} from DB")
+                    return rewrite.proposed_prompt
+        except Exception as e:
+            logger.warning(f"Failed to check database for approved prompt: {e}")
+            
+        # Fallback to default prompts defined in MetaAgent
+        from app.agents.meta import MetaAgent
+        return MetaAgent.AGENT_PROMPTS.get(self.agent_id, "")
 
     # =========================================================================
     # LLM Calls
@@ -328,28 +382,129 @@ class BaseAgent(ABC):
         self,
         tool_name: str,
         ctx: ContextObject,
-        retry_number: int = 0,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
-        Execute tool via registry.
+        Execute tool via registry with explicit failure retry and database logging.
         """
-
-        self._log_event(
-            job_id=ctx.job_id,
-            event_type="tool_call",
-            input_payload={
-                "tool": tool_name,
-                "params": kwargs,
-            },
-        )
-
-        return await self.tools.execute(
-            tool_name=tool_name,
-            agent_id=self.agent_id,
-            retry_number=retry_number,
-            **kwargs,
-        )
+        import re
+        from app.db.connection import save_tool_call
+        from app.schemas import ToolResult
+        from app.tools.base import ToolResultStatus
+        
+        retry_number = 0
+        max_retries = 2
+        
+        last_result = {}
+        
+        while retry_number <= max_retries:
+            # 1. Log the event in memory
+            self._log_event(
+                job_id=ctx.job_id,
+                event_type="tool_call",
+                input_payload={
+                    "tool": tool_name,
+                    "params": kwargs,
+                    "retry_number": retry_number,
+                },
+            )
+            
+            start_time = time.time()
+            
+            # 2. Execute tool
+            result = await self.tools.execute(
+                tool_name=tool_name,
+                agent_id=self.agent_id,
+                retry_number=retry_number,
+                job_id=ctx.job_id,
+                **kwargs,
+            )
+            
+            latency_ms = int((time.time() - start_time) * 1000)
+            
+            # 3. Acceptance evaluation
+            accepted = True
+            rejection_reason = None
+            
+            status = result.get("status")
+            if status in ["timeout", "error", "sandbox_violation", "invalid_input"]:
+                accepted = False
+                rejection_reason = result.get("error", "Tool execution error status")
+            elif tool_name == "web_search":
+                if not result.get("results") or len(result.get("results", [])) == 0:
+                    accepted = False
+                    rejection_reason = "No search results returned"
+            elif tool_name == "code_execution":
+                if result.get("exit_code") != 0:
+                    accepted = False
+                    rejection_reason = f"Execution failed with non-zero exit code: {result.get('exit_code')}"
+            elif tool_name == "nl2sql":
+                if result.get("row_count", 0) == 0:
+                    accepted = False
+                    rejection_reason = "Query returned empty results"
+            
+            # 4. Log retry details to DB
+            try:
+                await save_tool_call(
+                    job_id=ctx.job_id,
+                    agent_id=self.agent_id,
+                    tool_name=tool_name,
+                    input_data=kwargs,
+                    output_data=result,
+                    latency_ms=latency_ms,
+                    accepted=accepted,
+                    rejection_reason=rejection_reason,
+                    retry_number=retry_number,
+                )
+            except Exception as e:
+                logger.error(f"Failed to save tool call to database: {e}")
+            
+            # 5. Populate ctx.tool_results with the trace
+            ctx.tool_results[f"{tool_name}_retry_{retry_number}"] = ToolResult(
+                tool_name=tool_name,
+                input_params=kwargs,
+                output=result,
+                latency_ms=latency_ms,
+                accepted=accepted,
+                rejection_reason=rejection_reason,
+                retry_number=retry_number,
+            )
+            
+            if accepted:
+                ctx.tool_results[tool_name] = ctx.tool_results[f"{tool_name}_retry_{retry_number}"]
+                return result
+                
+            # If rejected, reformulate query/input in explicit code fallback logic
+            logger.warning(f"Tool {tool_name} output rejected on attempt {retry_number} in job {ctx.job_id}. Retrying...")
+            
+            # Fallback input reformulation
+            modified_kwargs = kwargs.copy()
+            if tool_name == "web_search":
+                q = kwargs.get("query", "")
+                if len(q.split()) > 4:
+                    # Narrow down
+                    modified_kwargs["query"] = " ".join(q.split()[:3])
+                else:
+                    # Broaden
+                    modified_kwargs["query"] = f"{q} overview"
+            elif tool_name == "code_execution":
+                code = kwargs.get("code", "")
+                if "print " in code and "print(" not in code:
+                    modified_kwargs["code"] = re.sub(r'print\s+(["\'].*?["\'])', r'print(\1)', code)
+            elif tool_name == "nl2sql":
+                q = kwargs.get("query", "")
+                if "count" in q.lower():
+                    modified_kwargs["query"] = "total jobs"
+                else:
+                    modified_kwargs["query"] = "recent jobs"
+                    
+            kwargs = modified_kwargs
+            last_result = result
+            retry_number += 1
+            
+        # Return the last attempt result
+        ctx.tool_results[tool_name] = ctx.tool_results[f"{tool_name}_retry_{max_retries}"]
+        return last_result
 
     # =========================================================================
     # Log Access

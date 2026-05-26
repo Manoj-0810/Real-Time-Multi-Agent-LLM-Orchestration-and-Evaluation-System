@@ -280,7 +280,10 @@ class SynthesisAgent(BaseAgent):
         if not output_texts:
             return "No valid outputs to synthesize."
         
-        prompt = f"""Synthesize the following agent outputs into a single coherent answer.
+        system_prompt = await self.get_effective_prompt()
+        prompt = f"""{system_prompt}
+
+Synthesize the following agent outputs into a single coherent answer.
 
 Original question: {ctx.query}
 

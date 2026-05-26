@@ -198,30 +198,24 @@ class ContextBudgetManager:
 
         self.violations.append(violation)
 
-        # Structured log sink
-        if self.log_sink:
+        # Structured database logging for policy violation
+        import asyncio
+        from app.db.connection import save_agent_log
 
-            import asyncio
-
-            entry = StructuredLogEntry(
-                agent_id=agent_id,
-                job_id=self.job_id,
-                event_type="budget_check",
-                policy_violations=[
-                    f"budget_overflow:{overflow}"
-                ],
+        try:
+            asyncio.create_task(
+                save_agent_log(
+                    job_id=self.job_id,
+                    agent_id=agent_id,
+                    event_type="policy_violation",
+                    policy_violations=[f"budget_overflow:{overflow}"],
+                    output_payload=violation,
+                )
             )
-
-            try:
-                asyncio.create_task(
-                    self.log_sink.write(entry)
-                )
-
-            except Exception:
-                logger.exception(
-                    "Failed to write budget violation "
-                    "to log sink"
-                )
+        except Exception:
+            logger.exception(
+                "Failed to write budget violation to database"
+            )
 
     def get_budget_status(
         self,

@@ -122,6 +122,7 @@ class CritiqueAgent(BaseAgent):
             critiques = await self._critique_agent_output(
                 agent_id,
                 output,
+                ctx,
             )
 
             all_critiques.extend(critiques)
@@ -203,13 +204,82 @@ class CritiqueAgent(BaseAgent):
         self,
         agent_id: str,
         output: AgentOutput,
+        ctx: ContextObject,
     ) -> List[CritiqueResult]:
         """
-        Critique a single agent output.
+        Critique a single agent output using LLM-augmented critique or fallback heuristics.
         """
 
-        critiques = []
+        # 1. Attempt LLM-augmented critique if gateway has providers
+        if self.llm and getattr(self.llm, "_providers", None):
+            try:
+                system_prompt = await self.get_effective_prompt()
+                prompt = f"""{system_prompt}
 
+You are reviewing the output of another agent in our multi-agent pipeline.
+Agent ID to Critique: {agent_id}
+Agent Output Content:
+{output.content}
+
+Your task is to critique this output. Identify key factual claims and evaluate them carefully.
+For each key factual claim:
+1. Assess correctness and reliability, scoring it from 0.0 to 1.0 (where 1.0 is completely verified and robust, and 0.0 is completely false/hallucinated).
+2. Identify the specific incorrect or unsupported text span as 'flagged_span' (or set it to null if the claim is fully accurate and supported).
+3. Provide a clear reason explaining your confidence score.
+
+Your response MUST be a valid JSON object matching this exact format:
+{{
+  "critiques": [
+    {{
+      "claim": "The specific claim extracted.",
+      "confidence": 0.85,
+      "flagged_span": "Substring of flagged text, or null if fully accurate.",
+      "reason": "Justification for confidence."
+    }}
+  ]
+}}
+
+Provide ONLY the raw JSON output. Do NOT include markdown formatting, backticks, or any explanation wrapper.
+"""
+                response_content = await self._call_llm(prompt, ctx, max_tokens=1536, temperature=0.2)
+                cleaned = response_content.strip()
+                if cleaned.startswith("```"):
+                    cleaned = re.sub(r"^```(?:json)?\n", "", cleaned)
+                    cleaned = re.sub(r"\n```$", "", cleaned)
+                    cleaned = cleaned.strip()
+
+                data = json.loads(cleaned)
+                critiques = []
+                for item in data.get("critiques", []):
+                    claim = item.get("claim", "").strip()
+                    if not claim:
+                        continue
+                    confidence = float(item.get("confidence", 0.5))
+                    confidence = max(0.0, min(1.0, confidence))
+                    flagged_span = item.get("flagged_span")
+                    if flagged_span:
+                        flagged_span = str(flagged_span).strip()
+                        if flagged_span.lower() in ("null", "none", ""):
+                            flagged_span = None
+                    reason = item.get("reason", "").strip() or "Evaluated by LLM Critique"
+
+                    critiques.append(
+                        CritiqueResult(
+                            claim=claim,
+                            confidence=confidence,
+                            flagged_span=flagged_span,
+                            reason=reason,
+                            agent_source=agent_id,
+                        )
+                    )
+                if critiques:
+                    logger.info(f"CritiqueAgent successfully generated {len(critiques)} LLM-augmented critiques for agent {agent_id}")
+                    return critiques
+            except Exception as e:
+                logger.warning(f"LLM-augmented critique failed or returned invalid JSON ({e}). Falling back to heuristic critique.", exc_info=True)
+
+        # 2. Fallback to heuristic critique
+        critiques = []
         claims = self._extract_claims(
             output.content
         )

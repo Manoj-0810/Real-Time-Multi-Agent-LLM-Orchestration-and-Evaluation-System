@@ -391,3 +391,185 @@ async def similarity_search(
             })
 
         return rows
+
+
+# =============================================================================
+# Helper DB Operations for Observability & Evaluation
+# =============================================================================
+
+async def create_job(job_id: str, query: str) -> None:
+    """
+    Insert a new Job record in the database with status 'running'.
+    """
+    from app.db.models import Job
+    import uuid
+    from datetime import datetime
+
+    async with get_session() as session:
+        job = Job(
+            id=uuid.UUID(job_id) if isinstance(job_id, str) else job_id,
+            query=query,
+            status="running",
+            created_at=datetime.utcnow(),
+        )
+        session.add(job)
+        await session.commit()
+        logger.info(f"Created job {job_id} in database")
+
+
+async def update_job_status(job_id: str, status: str) -> None:
+    """
+    Update the status of a Job record.
+    """
+    from app.db.models import Job
+    from sqlalchemy import update
+    import uuid
+    from datetime import datetime
+
+    async with get_session() as session:
+        vals = {"status": status}
+        if status in ["completed", "failed"]:
+            vals["completed_at"] = datetime.utcnow()
+        
+        await session.execute(
+            update(Job)
+            .where(Job.id == (uuid.UUID(job_id) if isinstance(job_id, str) else job_id))
+            .values(**vals)
+        )
+        await session.commit()
+        logger.info(f"Updated job {job_id} status to {status}")
+
+
+async def save_agent_log(
+    job_id: str,
+    agent_id: str,
+    event_type: str,
+    input_hash: Optional[str] = None,
+    output_hash: Optional[str] = None,
+    input_payload: Optional[Dict[str, Any]] = None,
+    output_payload: Optional[Dict[str, Any]] = None,
+    latency_ms: Optional[int] = None,
+    token_count: Optional[int] = None,
+    policy_violations: Optional[List[str]] = None,
+) -> None:
+    """
+    Save a structured AgentLog record to the database.
+    """
+    from app.db.models import AgentLog
+    import uuid
+    from datetime import datetime
+
+    async with get_session() as session:
+        log = AgentLog(
+            job_id=uuid.UUID(job_id) if isinstance(job_id, str) else job_id,
+            agent_id=agent_id,
+            event_type=event_type,
+            input_hash=input_hash,
+            output_hash=output_hash,
+            input_payload=input_payload,
+            output_payload=output_payload,
+            latency_ms=latency_ms,
+            token_count=token_count,
+            policy_violations=policy_violations or [],
+            timestamp=datetime.utcnow(),
+        )
+        session.add(log)
+        await session.commit()
+        logger.debug(f"Saved agent log for {agent_id} ({event_type}) in job {job_id}")
+
+
+async def save_tool_call(
+    job_id: str,
+    agent_id: str,
+    tool_name: str,
+    input_data: Dict[str, Any],
+    output_data: Dict[str, Any],
+    latency_ms: Optional[int] = None,
+    accepted: Optional[bool] = True,
+    rejection_reason: Optional[str] = None,
+    retry_number: int = 0,
+) -> None:
+    """
+    Save a ToolCall record to the database.
+    """
+    from app.db.models import ToolCall
+    import uuid
+    from datetime import datetime
+
+    async with get_session() as session:
+        call = ToolCall(
+            job_id=uuid.UUID(job_id) if isinstance(job_id, str) else job_id,
+            agent_id=agent_id,
+            tool_name=tool_name,
+            input=input_data,
+            output=output_data,
+            latency_ms=latency_ms,
+            accepted=accepted,
+            rejection_reason=rejection_reason,
+            retry_number=retry_number,
+            timestamp=datetime.utcnow(),
+        )
+        session.add(call)
+        await session.commit()
+        logger.debug(f"Saved tool call {tool_name} by {agent_id} in job {job_id}")
+
+
+async def save_eval_run(
+    run_id: str,
+    test_cases: List[Dict[str, Any]],
+    summary: Dict[str, Any],
+    diff_from_previous: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Save an EvalRun record to the database.
+    """
+    from app.db.models import EvalRun
+    import uuid
+    from datetime import datetime
+
+    async with get_session() as session:
+        run = EvalRun(
+            id=uuid.UUID(run_id) if isinstance(run_id, str) else run_id,
+            test_cases=test_cases,
+            summary=summary,
+            diff_from_previous=diff_from_previous,
+            run_timestamp=datetime.utcnow(),
+        )
+        session.add(run)
+        await session.commit()
+        logger.info(f"Saved evaluation run {run_id} in database")
+
+
+async def save_prompt_rewrite(
+    eval_run_id: str,
+    agent_id: str,
+    dimension: str,
+    original_prompt: str,
+    proposed_prompt: str,
+    diff: str,
+    justification: str,
+    status: str = "pending",
+) -> str:
+    """
+    Save a PromptRewrite record to the database and return its ID.
+    """
+    from app.db.models import PromptRewrite
+    import uuid
+    from datetime import datetime
+
+    async with get_session() as session:
+        rewrite = PromptRewrite(
+            eval_run_id=uuid.UUID(eval_run_id) if isinstance(eval_run_id, str) else eval_run_id,
+            agent_id=agent_id,
+            dimension=dimension,
+            original_prompt=original_prompt,
+            proposed_prompt=proposed_prompt,
+            diff=diff,
+            justification=justification,
+            status=status,
+            created_at=datetime.utcnow(),
+        )
+        session.add(rewrite)
+        await session.commit()
+        logger.info(f"Saved prompt rewrite proposal {rewrite.id} for agent {agent_id}")
+        return str(rewrite.id)
