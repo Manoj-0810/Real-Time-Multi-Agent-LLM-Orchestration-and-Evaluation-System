@@ -1,3 +1,6 @@
+# NOTE: RepoSage auto-patch applied to backend/app/agents/decomposition.py
+# Description: Remove the unused method.
+
 # =============================================================================
 # MEGA AI — Decomposition Agent
 # =============================================================================
